@@ -7,6 +7,8 @@ import { dirname, join } from 'path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: join(__dirname, '.env') });
 
+const customUserAgent = 'Trakt-PMDB-Sync/1.0';
+
 const CONFIG = {
   trakt: {
     baseUrl: 'https://api.trakt.tv',
@@ -15,24 +17,15 @@ const CONFIG = {
       'trakt-api-version': '2',
       'trakt-api-key': process.env.TRAKT_CLIENT_ID,
       'Authorization': `Bearer ${process.env.TRAKT_ACCESS_TOKEN}`,
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+      'User-Agent': customUserAgent
     }
   },
   pmdb: {
     baseUrl: 'https://publicmetadb.com/api/external',
     headers: {
-      'Authorization': `Bearer ${process.env.PMDB_API_KEY}`,
       'Content-Type': 'application/json',
-      // The Stealth Headers:
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': '"Windows"',
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-site'
+      'Authorization': `Bearer ${process.env.PMDB_API_KEY}`,
+      'User-Agent': customUserAgent
     }
   }
 };
@@ -53,6 +46,7 @@ const requestWithRetry = async (config) => {
   }, { retries: 3 });
 };
 
+// HELPER: Normalizes dates to Unix seconds to ignore formatting/millisecond differences
 const normalizeDate = (dateStr) => {
   if (!dateStr) return 'unknown';
   return Math.floor(new Date(dateStr).getTime() / 1000);
@@ -156,8 +150,9 @@ async function runExactSync() {
       return;
     }
 
+    // Failsafe: Prevent massive deletions if something goes wrong
     if (toDelete.length > 100) {
-      console.warn(`⚠️ WARNING: Attempting to delete ${toDelete.length} items. Aborting to protect your PMDB history.`);
+      console.warn(`⚠️ WARNING: Attempting to delete ${toDelete.length} items. Aborting to protect your PMDB history. If this is expected, temporarily remove this failsafe from the code.`);
       return;
     }
 
