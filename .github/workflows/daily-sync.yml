@@ -2,12 +2,12 @@ name: 24h Trakt to PMDB Sync
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Runs automatically every 24 hours at Midnight UTC
-  workflow_dispatch:    # Allows you to click a "Run Workflow" button manually in GitHub
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 jobs:
   sync-database:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest # <-- This is the infrastructure bypass trick
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
