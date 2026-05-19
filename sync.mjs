@@ -2,6 +2,9 @@ import axios from 'axios';
 import pRetry from 'p-retry';
 import 'dotenv/config';
 
+// Use a custom User-Agent so PMDB/Cloudflare doesn't block GitHub Actions as a spam bot
+const customUserAgent = 'Trakt-PMDB-Sync/1.0 (GitHub Actions; Node.js)';
+
 const CONFIG = {
   trakt: {
     baseUrl: 'https://api.trakt.tv',
@@ -10,18 +13,20 @@ const CONFIG = {
       'trakt-api-version': '2',
       'trakt-api-key': process.env.TRAKT_CLIENT_ID,
       'Authorization': `Bearer ${process.env.TRAKT_ACCESS_TOKEN}`,
+      'User-Agent': customUserAgent
     }
   },
   pmdb: {
     baseUrl: 'https://publicmetadb.com/api/external',
     headers: {
+      'Content-Type': 'application/json',
       'Authorization': `Bearer ${process.env.PMDB_API_KEY}`,
-      'Content-Type': 'application/json'
+      'User-Agent': customUserAgent
     }
   }
 };
 
-// 1. Smart Network Helper (Handles 429 Rate Limits automatically)
+// --- Smart Network Helper ---
 const requestWithRetry = async (config) => {
   return pRetry(async () => {
     try {
@@ -38,7 +43,7 @@ const requestWithRetry = async (config) => {
   }, { retries: 3 });
 };
 
-// 2. Fetch Master State from Trakt
+// --- 1. Fetch Master State from Trakt ---
 async function getTraktHistory() {
   console.log('📡 Fetching Master State from Trakt...');
   let page = 1;
@@ -58,7 +63,7 @@ async function getTraktHistory() {
       const isMovie = item.type === 'movie';
       const tmdb_id = isMovie ? item.movie.ids.tmdb : item.show.ids.tmdb;
       
-      // Create a unique hash for exact matching (e.g., "movie_123_2026-05-19T...Z")
+      // Hash includes the exact timestamp to track multiple watches of the same movie
       const uniqueKey = isMovie 
         ? `movie_${tmdb_id}_${item.watched_at}` 
         : `tv_${tmdb_id}_s${item.episode.season}e${item.episode.number}_${item.watched_at}`;
@@ -76,28 +81,45 @@ async function getTraktHistory() {
   return history;
 }
 
-// 3. Fetch Current State from PMDB
+// --- 2. Fetch Current State from PMDB ---
 async function getPMDBHistory() {
   console.log('📡 Fetching Current State from PMDB...');
-  // Note: Adjust this URL if PMDB uses a different endpoint for fetching history
-  const res = await requestWithRetry({
-    method: 'get',
-    url: `${CONFIG.pmdb.baseUrl}/watched`, 
-    headers: CONFIG.pmdb.headers
-  });
-
+  let page = 1;
+  let hasMore = true;
   const history = new Map();
-  for (const item of res.data) {
-    const uniqueKey = item.media_type === 'movie'
-      ? `movie_${item.tmdb_id}_${item.watched_at}`
-      : `tv_${item.tmdb_id}_s${item.season}e${item.episode}_${item.watched_at}`;
-    
-    history.set(uniqueKey, item);
+
+  while (hasMore) {
+    const res = await requestWithRetry({
+      method: 'get',
+      // Max perPage is 500 according to PMDB docs
+      url: `${CONFIG.pmdb.baseUrl}/watched?page=${page}&perPage=500`, 
+      headers: CONFIG.pmdb.headers
+    });
+
+    const items = res.data;
+    if (items.length === 0) {
+      hasMore = false;
+      break;
+    }
+
+    for (const item of items) {
+      const uniqueKey = item.media_type === 'movie'
+        ? `movie_${item.tmdb_id}_${item.watched_at}`
+        : `tv_${item.tmdb_id}_s${item.season}e${item.episode}_${item.watched_at}`;
+      
+      // Store the PMDB internal ID so we can delete it if necessary
+      history.set(uniqueKey, { pmdb_internal_id: item.id });
+    }
+
+    // If PMDB returned less than 500 items, we've hit the last page
+    if (items.length < 500) hasMore = false;
+    page++;
   }
+  
   return history;
 }
 
-// 4. Calculate Diff & Sync
+// --- 3. Execute Exact Sync ---
 async function runExactSync() {
   try {
     const traktMap = await getTraktHistory();
@@ -106,45 +128,53 @@ async function runExactSync() {
     const toAdd = [];
     const toDelete = [];
 
-    // Find Additions
+    // Find what is in Trakt but missing in PMDB
     for (const [key, payload] of traktMap.entries()) {
       if (!pmdbMap.has(key)) toAdd.push(payload);
     }
 
-    // Find Deletions
-    for (const [key, pmdbItem] of pmdbMap.entries()) {
-      if (!traktMap.has(key)) toDelete.push(pmdbItem);
+    // Find what is in PMDB but missing in Trakt
+    for (const [key, pmdbPayload] of pmdbMap.entries()) {
+      if (!traktMap.has(key)) toDelete.push(pmdbPayload.pmdb_internal_id);
     }
 
     console.log(`\n📊 Sync Analysis: ${toAdd.length} to ADD | ${toDelete.length} to DELETE\n`);
 
     if (toAdd.length === 0 && toDelete.length === 0) {
-      console.log('✅ Trakt and PMDB are already perfectly synced.');
+      console.log('✅ Databases are completely identical. No sync needed.');
       return;
     }
 
-    // Process Additions
+    // 4. Process Additions
+    let addedCount = 0;
     for (const payload of toAdd) {
-      await requestWithRetry({
-        method: 'post',
-        url: `${CONFIG.pmdb.baseUrl}/watched?dedupe=true`,
-        headers: CONFIG.pmdb.headers,
-        data: payload
-      });
+      try {
+        await requestWithRetry({
+          method: 'post',
+          url: `${CONFIG.pmdb.baseUrl}/watched?dedupe=true`,
+          headers: CONFIG.pmdb.headers,
+          data: payload
+        });
+        addedCount++;
+      } catch (e) {
+        // Silently skip individual errors (like missing TMDB IDs)
+      }
     }
 
-    // Process Deletions
-    for (const item of toDelete) {
-      // Note: Adjust this URL if PMDB uses a different format for deleting an item
-      await requestWithRetry({
-        method: 'delete',
-        url: `${CONFIG.pmdb.baseUrl}/watched`, 
-        headers: CONFIG.pmdb.headers,
-        data: { tmdb_id: item.tmdb_id, media_type: item.media_type }
-      });
+    // 5. Process Deletions (Uses the precise endpoint from PMDB docs)
+    let deletedCount = 0;
+    for (const internalId of toDelete) {
+      try {
+        await requestWithRetry({
+          method: 'delete',
+          url: `${CONFIG.pmdb.baseUrl}/watched/${internalId}`,
+          headers: CONFIG.pmdb.headers
+        });
+        deletedCount++;
+      } catch (e) {}
     }
 
-    console.log('✅ Exact Sync Complete! PMDB is a perfect mirror of Trakt.');
+    console.log(`✅ Exact Sync Complete! Added: ${addedCount} | Deleted: ${deletedCount}`);
   } catch (err) {
     console.error('❌ Sync Failed:', err.message);
     process.exit(1);
