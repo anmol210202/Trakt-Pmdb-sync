@@ -1,9 +1,13 @@
 import axios from 'axios';
 import pRetry from 'p-retry';
-import 'dotenv/config';
+import * as dotenv from 'dotenv';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
-// Use a custom User-Agent so PMDB/Cloudflare doesn't block GitHub Actions as a spam bot
-const customUserAgent = 'Trakt-PMDB-Sync/1.0 (GitHub Actions; Node.js)';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: join(__dirname, '.env') });
+
+const customUserAgent = 'Trakt-PMDB-Sync/1.0';
 
 const CONFIG = {
   trakt: {
@@ -26,7 +30,6 @@ const CONFIG = {
   }
 };
 
-// --- Smart Network Helper ---
 const requestWithRetry = async (config) => {
   return pRetry(async () => {
     try {
@@ -43,7 +46,12 @@ const requestWithRetry = async (config) => {
   }, { retries: 3 });
 };
 
-// --- 1. Fetch Master State from Trakt ---
+// HELPER: Normalizes dates to Unix seconds to ignore formatting/millisecond differences
+const normalizeDate = (dateStr) => {
+  if (!dateStr) return 'unknown';
+  return Math.floor(new Date(dateStr).getTime() / 1000);
+};
+
 async function getTraktHistory() {
   console.log('📡 Fetching Master State from Trakt...');
   let page = 1;
@@ -59,14 +67,16 @@ async function getTraktHistory() {
     
     if (page === 1) totalPages = parseInt(res.headers['x-pagination-page-count'] || 1);
     
-    for (const item of res.data) {
+    const items = Array.isArray(res.data) ? res.data : (res.data.data || res.data.items || []);
+    
+    for (const item of items) {
       const isMovie = item.type === 'movie';
       const tmdb_id = isMovie ? item.movie.ids.tmdb : item.show.ids.tmdb;
+      const timeKey = normalizeDate(item.watched_at);
       
-      // Hash includes the exact timestamp to track multiple watches of the same movie
       const uniqueKey = isMovie 
-        ? `movie_${tmdb_id}_${item.watched_at}` 
-        : `tv_${tmdb_id}_s${item.episode.season}e${item.episode.number}_${item.watched_at}`;
+        ? `movie_${tmdb_id}_${timeKey}` 
+        : `tv_${tmdb_id}_s${item.episode.season}e${item.episode.number}_${timeKey}`;
 
       history.set(uniqueKey, {
         tmdb_id: tmdb_id,
@@ -81,7 +91,6 @@ async function getTraktHistory() {
   return history;
 }
 
-// --- 2. Fetch Current State from PMDB ---
 async function getPMDBHistory() {
   console.log('📡 Fetching Current State from PMDB...');
   let page = 1;
@@ -91,27 +100,26 @@ async function getPMDBHistory() {
   while (hasMore) {
     const res = await requestWithRetry({
       method: 'get',
-      // Max perPage is 500 according to PMDB docs
       url: `${CONFIG.pmdb.baseUrl}/watched?page=${page}&perPage=500`, 
       headers: CONFIG.pmdb.headers
     });
 
-    const items = res.data;
+    const items = Array.isArray(res.data) ? res.data : (res.data.data || res.data.items || []);
+    
     if (items.length === 0) {
       hasMore = false;
       break;
     }
 
     for (const item of items) {
+      const timeKey = normalizeDate(item.watched_at);
       const uniqueKey = item.media_type === 'movie'
-        ? `movie_${item.tmdb_id}_${item.watched_at}`
-        : `tv_${item.tmdb_id}_s${item.season}e${item.episode}_${item.watched_at}`;
+        ? `movie_${item.tmdb_id}_${timeKey}`
+        : `tv_${item.tmdb_id}_s${item.season}e${item.episode}_${timeKey}`;
       
-      // Store the PMDB internal ID so we can delete it if necessary
       history.set(uniqueKey, { pmdb_internal_id: item.id });
     }
 
-    // If PMDB returned less than 500 items, we've hit the last page
     if (items.length < 500) hasMore = false;
     page++;
   }
@@ -119,7 +127,6 @@ async function getPMDBHistory() {
   return history;
 }
 
-// --- 3. Execute Exact Sync ---
 async function runExactSync() {
   try {
     const traktMap = await getTraktHistory();
@@ -128,12 +135,10 @@ async function runExactSync() {
     const toAdd = [];
     const toDelete = [];
 
-    // Find what is in Trakt but missing in PMDB
     for (const [key, payload] of traktMap.entries()) {
       if (!pmdbMap.has(key)) toAdd.push(payload);
     }
 
-    // Find what is in PMDB but missing in Trakt
     for (const [key, pmdbPayload] of pmdbMap.entries()) {
       if (!traktMap.has(key)) toDelete.push(pmdbPayload.pmdb_internal_id);
     }
@@ -145,7 +150,12 @@ async function runExactSync() {
       return;
     }
 
-    // 4. Process Additions
+    // Failsafe: Prevent massive deletions if something goes wrong
+    if (toDelete.length > 100) {
+      console.warn(`⚠️ WARNING: Attempting to delete ${toDelete.length} items. Aborting to protect your PMDB history. If this is expected, temporarily remove this failsafe from the code.`);
+      return;
+    }
+
     let addedCount = 0;
     for (const payload of toAdd) {
       try {
@@ -156,12 +166,9 @@ async function runExactSync() {
           data: payload
         });
         addedCount++;
-      } catch (e) {
-        // Silently skip individual errors (like missing TMDB IDs)
-      }
+      } catch (e) {}
     }
 
-    // 5. Process Deletions (Uses the precise endpoint from PMDB docs)
     let deletedCount = 0;
     for (const internalId of toDelete) {
       try {
