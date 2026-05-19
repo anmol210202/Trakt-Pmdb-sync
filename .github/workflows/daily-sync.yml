@@ -1,0 +1,28 @@
+name: 24h Trakt to PMDB Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs automatically every 24 hours at Midnight UTC
+  workflow_dispatch:    # Allows you to click a "Run Workflow" button manually in GitHub
+
+jobs:
+  sync-database:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Run Exact Sync
+        run: node sync.mjs
+        env:
+          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
+          TRAKT_ACCESS_TOKEN: ${{ secrets.TRAKT_ACCESS_TOKEN }}
+          PMDB_API_KEY: ${{ secrets.PMDB_API_KEY }}
